@@ -1,0 +1,19 @@
+{
+  "name": "vidcode",
+  "version": "1.0.0",
+  "description": "Process video files from a watch folder",
+  "main": "vidcode.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "Brian K. Schantz",
+  "license": "ISC",
+  "dependencies": {
+    "chokidar": "^1.7.0",
+    "clone": "^2.1.1",
+    "commander": "^2.11.0",
+    "logger": "0.0.1",
+    "q": "^1.5.0",
+    "watch": "^1.0.2"
+  }
+}

@@ -1,0 +1,85 @@
+{
+  "watch": "M:\\HandbrakeTemp\\watch",
+  "source_destination": "M:\\HandbrakeTemp\\converted",
+  "selection": {
+    "video": [
+      {
+        "resolution": "max"
+      },
+      {
+        "duration": "max"
+      },
+      {
+        "codec": [
+          "hevc",
+          "h264"
+        ]
+      }
+    ],
+    "audio": [
+      {
+        "language": [
+          "eng"
+        ]
+      },
+      {
+        "codec": [
+          "dts",
+          "ac3",
+          "aac"
+        ]
+      },
+      {
+        "channels": "max"
+      }
+    ],
+    "subtitle": [
+      [
+        {
+          "foreign": []
+        },
+        {
+          "language": [
+            "eng"
+          ]
+        }
+      ],
+      [
+        {
+          "language": [
+            "eng"
+          ]
+        }
+      ]
+    ]
+  },
+  "output": {
+    "global": {
+      "path": "M:\\HandbrakeTemp\\out",
+      "options": [
+        "-hide_banner",
+        "-y",
+        "-hwaccel", "cuvid"
+      ]
+    },
+    "video": {
+      "encoder": "hevc_nvenc",
+      "options": [
+        "-rc:v", "vbr",
+        "-cq", "18",
+        "-rc-lookahead", "32"
+      ]
+    },
+    "audio": {
+      "encoder": "dca",
+      "options": [
+        "-strict", "-2",
+        "-ab", "1536k"
+      ]
+    },
+    "subtitle": {
+      "encoder": "srt",
+      "options": []
+    }
+  }
+}
