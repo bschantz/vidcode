@@ -1,31 +1,67 @@
-"use strict";
 const fs = require("fs");
 const util = require("util");
 const child_process = require("child_process");
 const chokidar = require("chokidar");
 const clone = require("clone");
+const queue = require("promise-queue");
+const moment = require("moment");
+require("moment-duration-format");
 
 const config = require("./vidcode.json");
 const path = require("path");
 
 const fs_open = util.promisify(fs.open);
 const execFile_p = util.promisify(child_process.execFile);
+const readFile_p = util.promisify(fs.readFile);
+const writeFile_p = util.promisify(fs.writeFile);
 
-let filename;
+const imageSubs = [
+    "hdmv_pgs_subtitle",
+    "dvd_subtitle"
+];
 
-const watcher = chokidar.watch(config.watch, {
+process.on('unhandledRejection', (reason) => {
+    "use strict";
+    console.error(reason);
+});
+
+const watcher = chokidar.watch(config.paths.watch, {
     persistent: true,
     followSymlinks: false,
     usePolling: true,
-    depth: undefined,
+    depth: 1,
     interval: 100,
-    ignorePermissionErrors: false
+    ignorePermissionErrors: false,
+    awaitWriteFinish: false
 });
 
+const processorQueue = new queue(1, Infinity);
+
 watcher.on('add', async (_filename) => {
-    filename = _filename;
-    await waitForCopyComplete(filename);
-    const streamData = await ffProbeData(filename);
+    console.log(`Watcher saw ${_filename}`);
+    // don't add file multiple times
+    watcher.unwatch(_filename);
+    await waitForCopyComplete(_filename);
+
+    console.log(`Adding ${_filename} to process queue`);
+    processorQueue.add(await transcode.bind(null, _filename))
+        .then((result) => {
+            "use strict";
+            console.log("processing complete");
+            console.log(result);
+        });
+});
+
+async function transcode(filename) {
+    "use strict";
+    console.log(`Processing ${filename} from queue`);
+    return await processVideo(filename);
+}
+
+async function processVideo(filename) {
+    console.warn(`${arguments.callee.name}: ${filename}`);
+    const processFile = moveToProcessDirectory(filename);
+    const streamData = await ffProbeData(processFile);
     const sourceStreams = parseStreams(streamData);
     const selectedVideo = selectVideoStream(sourceStreams.video);
     console.info("Video stream selected: ");
@@ -33,7 +69,7 @@ watcher.on('add', async (_filename) => {
     const selectedAudio = selectAudioStreams(sourceStreams.audio);
     console.info("Audio stream(s) selected: ");
     console.info(selectedAudio.map((s) => s.index));
-    const selectedSubtitles = await selectSubtitleStreams(sourceStreams.subtitle);
+    const selectedSubtitles = await selectSubtitleStreams(sourceStreams.subtitle, processFile);
     console.info("Subtitle(s) selected: ");
     console.info(selectedSubtitles.map((s) => s.index));
     const selectedStreams = {
@@ -41,12 +77,13 @@ watcher.on('add', async (_filename) => {
         audio: selectedAudio,
         subtitle: selectedSubtitles,
     };
-    const ffmpegOptions = createConversionOptions(selectedStreams);
+    const ffmpegOptions = createConversionOptions(selectedStreams, processFile);
     await doConversion(ffmpegOptions);
-    moveSourceFile(filename);
-});
+    backupSourceFile(processFile);
+}
 
 async function waitForCopyComplete(path) {
+    console.warn(`${arguments.callee.name}: ${path}`);
     try {
         return await checkFileCopyComplete(path);
     } catch (err) {
@@ -67,11 +104,12 @@ async function checkFileCopyComplete(path) {
     let total_wait = 0;
     do {
         try {
-            const fd = await fs_open(path, "a+");
+            const fd = await fs_open(path, "r");
             fs.closeSync(fd);
+            console.log(`Done: ${path}`);
             return path;
         } catch (err) {
-            console.info(`Waiting ${WAIT_INTERVAL_MILLIS} ms`);
+            process.stdout.write(".");
             await delayCheck(WAIT_INTERVAL_MILLIS);
         }
         total_wait += WAIT_INTERVAL_MILLIS;
@@ -80,6 +118,7 @@ async function checkFileCopyComplete(path) {
 }
 
 function parseStreams(streams) {
+    console.warn(arguments.callee.name);
     const video_streams = streams.streams.filter((x) => x.codec_type === "video");
     const audio_streams = streams.streams.filter((x) => x.codec_type === "audio");
     const subtitle_streams = streams.streams.filter((x) => x.codec_type === "subtitle");
@@ -91,7 +130,7 @@ function parseStreams(streams) {
 }
 
 async function ffProbeData(filename) {
-    console.info(filename);
+    console.warn(`${arguments.callee.name}: ${filename}`);
     const execFile_p = util.promisify(child_process.execFile);
     try {
         const execResult = await execFile_p('ffprobe',
@@ -102,7 +141,7 @@ async function ffProbeData(filename) {
                 '-show_streams',
                 filename
             ],
-            { cwd: config.watch },
+            { cwd: config.paths.watch },
         );
         return JSON.parse(execResult.stdout);
     } catch (err) {
@@ -113,6 +152,7 @@ async function ffProbeData(filename) {
 }
 
 function selectVideoStream(streamArray) {
+    console.warn(`${arguments.callee.name}`);
     if (streamArray.length === 1) {
         return streamArray;
     } else {
@@ -121,6 +161,7 @@ function selectVideoStream(streamArray) {
 }
 
 function processVideoSelectors(streamArray) {
+    console.warn(arguments.callee.name);
     const rules = config.selection.video;
     let selected = streamArray;
     for (const rule of rules) {
@@ -144,29 +185,31 @@ function processVideoSelectors(streamArray) {
 }
 
 function selectVideoResolution(streamArray, rule) {
+    console.warn(arguments.callee.name);
     let selected = [];
     switch(rule.resolution) {
         case "min":
-            let min = streamArray.reduce((a, b) => {
-                return Math.min(a.width, b.width);
+            const min = streamArray.reduce((a, b) => {
+                return Math.min(a, b.width);
+            }, Infinity);
+            const minRes = streamArray.filter((s) => {
+                return s.width === min;
             });
-            selected = streamArray.find((s) => {
-                s.width = min.width;
-            });
+            selected = minRes || selected;
             break;
         case "max":
-            let max = streamArray.reduce((a, b) => {
-                return Math.max(a.width, b.width);
+            const max = streamArray.reduce((a, b) => {
+                return Math.max(a, b.width);
+            }, 0);
+            const maxRes = streamArray.filter((s) => {
+                return s.width === max;
             });
-            selected = streamArray.find((s) => {
-                s.width = max.width;
-            });
+            selected = maxRes || selected;
             break;
         default:
-            if (!isNan(rule.resolution)) {
-                selected = streamArray.find((s) => {
-                    // noinspection EqualityComparisonWithCoercionJS
-                    return s.width == rule.resolution;
+            if (!isNaN(rule.resolution)) {
+                selected = streamArray.filter((s) => {
+                    return s.width === rule.resolution;
                 })
             }
             break;
@@ -175,6 +218,7 @@ function selectVideoResolution(streamArray, rule) {
 }
 
 function selectVideoDuration(streamArray, rule) {
+    console.warn(arguments.callee.name);
     let selected;
     // duration may not be an attribute of the stream, so check for tags
     let tempStreamArray = streamArray.map((i) => {
@@ -188,21 +232,21 @@ function selectVideoDuration(streamArray, rule) {
     });
     switch(rule.duration) {
         case "min":
-            let min = tempStreamArray.reduce((a, b) => {
+            let min = tempStreamArray.reduce((accumulator, nextValue) => {
 
-                return Math.min(a.duration, b.duration);
-            });
-            selected = tempStreamArray.find((s) => {
-                s.duration = min.duration;
+                return Math.min(accumulator, nextValue.duration);
+            }, Infinity);
+            selected = tempStreamArray.filter((s) => {
+                return s.duration === min.duration;
             });
             break;
         case "max":
-            let max = tempStreamArray.reduce((a, b) => {
-                return Math.max(a.duration, b.duration);
+            let max = tempStreamArray.reduce((accumulator, nextValue) => {
+                return Math.max(accumulator, nextValue.duration);
             });
-            selected = tempStreamArray.find((s) => {
-                s.duration = max.duration;
-            });
+            selected = tempStreamArray.filter((s) => {
+                return s.duration === max.duration;
+            }, 0);
             break;
         default:
             throw new Error(`Invalid config value: ${rule.duration} is not a valid duration specifier.`);
@@ -214,6 +258,7 @@ function selectVideoDuration(streamArray, rule) {
 }
 
 function selectAudioStreams(streamArray) {
+    console.warn(`${arguments.callee.name}`);
     console.info("Selecting audio streams");
     if (streamArray.length === 1) {
         console.info("One stream in source, selecting by default");
@@ -225,6 +270,7 @@ function selectAudioStreams(streamArray) {
 }
 
 function processAudioSelectors(streamArray) {
+    console.warn(`${arguments.callee.name}`);
     const rules = config.selection.audio;
     let selected = streamArray;
     for (const rule of rules) {
@@ -248,6 +294,7 @@ function processAudioSelectors(streamArray) {
 }
 
 function selectAudioLanguage(streamArray, rule) {
+    console.warn(arguments.callee.name);
     console.info("Desired language tags:");
     rule.language.forEach((tag) => console.info(tag));
     return streamArray.filter((x) => {
@@ -256,6 +303,7 @@ function selectAudioLanguage(streamArray, rule) {
 }
 
 function selectAudioCodec(streamArray, rule) {
+    console.warn(`${arguments.callee.name}`);
     console.info("Desired audio codecs:");
     rule.codec.forEach((tag) => console.info(`Codec: ${tag}`));
     return streamArray.filter((x) => {
@@ -263,24 +311,90 @@ function selectAudioCodec(streamArray, rule) {
     })
 }
 
-async function selectSubtitleStreams(streamArray) {
+async function selectSubtitleStreams(streamArray, mediaFile) {
+    console.warn(`${arguments.callee.name}`);
     console.info("Selecting subtitle streams");
+    let subtitleStreams;
     if (streamArray.length === 1) {
         console.info("One stream in source, selecting by default");
-        return streamArray;
+        subtitleStreams = streamArray;
     } else {
         console.info("Processing subtitle selection rules");
-        return await processSubtitleSelectors(streamArray);
+        subtitleStreams =  await processSubtitleSelectors(streamArray, mediaFile);
     }
+    // check for bitmap subtitles
+    return await checkImageSubtitles(subtitleStreams, mediaFile);
+}
+
+async function checkImageSubtitles(streams, mediaFile) {
+    console.warn(`${arguments.callee.name}`);
+    for (let i = 0, ii = streams.length; i < ii; i++) {
+        const stream = streams[i];
+        if (imageSubs.includes(stream.codec_name)) {
+            let srtFile = await convertSubToSRT(stream, mediaFile);
+            console.info(`Generated SRT file ${srtFile}`);
+            streams[i].subFile = srtFile;
+        }
+    }
+    return streams;
+}
+
+async function convertSubToSRT(stream, mediaFile) {
+    console.warn(`${arguments.callee.name}`);
+    const srtFileName = path.join(config.paths.process, `sub_${stream.index}.srt`);
+    const ocrFile = `sub_ocr_${stream.index}.txt`;
+
+    const execFile_p = util.promisify(child_process.execFile);
+    try {
+        await execFile_p('ffmpeg',
+            [
+                '-y', '-v', 'error',
+                '-hwaccel', 'cuvid',
+                '-nostdin',
+                '-i', mediaFile, '-an',
+                '-filter_complex', `[0:s]ocr,metadata=key=lavfi.ocr.text:mode=print:file=${ocrFile},null`,
+                '-c:v', 'hevc_nvenc', '-rc:v', '1000', '-cbr', 'true',
+                'dummy.mkv'
+            ],
+            {
+                cwd: config.paths.process,
+                maxBuffer: 400 * 1024,
+            },
+        );
+    } catch (e) {
+        console.error(e);
+        throw e;
+    }
+    const srtData = await parseOcrFile(path.join(config.paths.process, ocrFile));
+    await writeFile_p(srtFileName, srtData);
+    try {
+        fs.unlinkSync(path.join(config.paths.process, 'dummy.mkv'));
+        fs.unlinkSync(path.join(config.paths.process, ocrFile));
+    } catch (err) {
+        /* errors ok here */
+        console.warn(err);
+    }
+    return srtFileName;
+}
+
+async function parseOcrFile(filename) {
+    "use strict";
+    const stream = await readFile_p(filename);
+
+    const parser = new ocrParser(stream.toString());
+
+    return parser.parse();
 }
 
 /** Process the stream array according to the subtitle selection rules
  *  Subtitles can have multiple sets of rules, so expects the rule list to be
  *  an array of arrays.
  * @param streamArray
+ * @param mediaFile {string}
  * @returns {*}
  */
-async function processSubtitleSelectors(streamArray) {
+async function processSubtitleSelectors(streamArray, mediaFile) {
+    console.warn(`${arguments.callee.name}`);
     const ruleSets = config.selection.subtitle;
     let streams = clone(streamArray);
     let selectedStreams = [];
@@ -299,7 +413,7 @@ async function processSubtitleSelectors(streamArray) {
                     break;
                 case "foreign":
                     console.info("Selecting subtitle by foreign audio search:");
-                    selected = await selectSubtitleForeignAudio(selected);
+                    selected = await selectSubtitleForeignAudio(selected, mediaFile);
                     break;
                 case "codec":
                     console.info("Selecting subtitle by codec:");
@@ -317,6 +431,7 @@ async function processSubtitleSelectors(streamArray) {
 }
 
 function selectSubtitleLanguage(streamArray, rule) {
+    console.warn(`${arguments.callee.name}`);
     console.info("Desired language tags:");
     rule.language.forEach((tag) => console.info(tag));
     return streamArray.filter((x) => {
@@ -324,11 +439,12 @@ function selectSubtitleLanguage(streamArray, rule) {
     })
 }
 
-async function selectSubtitleForeignAudio(streamArray) {
+async function selectSubtitleForeignAudio(streamArray, mediaFile) {
+    console.warn(`${arguments.callee.name}`);
     console.info("Foreign audio search:");
 
     try {
-        const subtitleCounts = await searchForeignAudio(streamArray);
+        const subtitleCounts = await searchForeignAudio(streamArray, mediaFile);
         let maxEntries = 0;
 
         // sort descending
@@ -350,7 +466,8 @@ async function selectSubtitleForeignAudio(streamArray) {
     }
 }
 
-async function searchForeignAudio(streams) {
+async function searchForeignAudio(streams, mediaFile) {
+    console.warn(`${arguments.callee.name}`);
     const chunk = 4;
     const results = [];
     let loop = 1;
@@ -358,7 +475,7 @@ async function searchForeignAudio(streams) {
         console.info(`getting subs chunk ${loop++}`);
         try {
             const streamChunk = streams.slice(i, i+chunk);
-            const result = await countSubtitlesChunked(streamChunk);
+            const result = await countSubtitlesChunked(streamChunk, mediaFile);
             results.concat(results, result);
         } catch (exc) {
             console.err(exc);
@@ -367,11 +484,12 @@ async function searchForeignAudio(streams) {
     return results;
 }
 
-async function countSubtitlesChunked(streams) {
+async function countSubtitlesChunked(streams, mediaFile) {
+    console.warn(`${arguments.callee.name}`);
     return Promise.all(
         streams.map(async (stream) => {
             try {
-                const sub = await ffMpegExtractSubtitle(filename, stream.index);
+                const sub = await ffMpegExtractSubtitle(mediaFile, stream.index, stream.codec_name);
                 const matches = sub.match(/(\d+(?=\n\d\d:\d\d:\d\d,\d+))/g);
                 const count = matches ? matches.length : 0;
                 return [count, stream];
@@ -384,6 +502,7 @@ async function countSubtitlesChunked(streams) {
 }
 
 function selectSubtitleCodec(streamArray, rule) {
+    console.warn(arguments.callee.name);
     console.info("Desired codec:");
     rule.codec.forEach((tag) => console.info(tag));
     return streamArray.filter((x) => {
@@ -391,8 +510,12 @@ function selectSubtitleCodec(streamArray, rule) {
     });
 }
 
-async function ffMpegExtractSubtitle(filename, streamId) {
+async function ffMpegExtractSubtitle(filename, streamId, codec) {
+    console.warn(`${arguments.callee.name}`);
     const execFile_p = util.promisify(child_process.execFile);
+
+    // map codec to output format
+    const format = mapSubtitleCodecToFormat(codec);
     try {
         const execResult = await execFile_p('ffmpeg',
             [
@@ -404,11 +527,11 @@ async function ffMpegExtractSubtitle(filename, streamId) {
                 '-map',
                 `0:${streamId}:0`,
                 '-f',
-                'srt',
+                `${format}`,
                 'pipe:1'
             ],
             {
-                cwd: config.watch,
+                cwd: config.paths.process,
                 maxBuffer: 400 * 1024,
             },
         );
@@ -421,18 +544,43 @@ async function ffMpegExtractSubtitle(filename, streamId) {
     }
 }
 
-function createConversionOptions(selectedStreams) {
-    const options = config.output.global.options;
+function mapSubtitleCodecToFormat(codec) {
+    "use strict";
+    const formats = {
+        'dvd_subtitle': 'dvd',
+    };
+    return formats[codec] || codec;
+}
+
+function createConversionOptions(selectedStreams, mediaFile) {
+    console.warn(`${arguments.callee.name}`);
+    let options = config.output.global.options;
+    options = options.concat("-i", mediaFile);
+    let externalSubs = getExternalSubsInput(selectedStreams.subtitle);
+    if (externalSubs !== false) {
+        options = options.concat(externalSubs);
+    }
     return options.concat(
-        "-i", filename,
         createMapOptions(selectedStreams),
         createVideoOptions(selectedStreams.video),
         createAudioOptions(selectedStreams.audio),
         createSubtitleOptions(selectedStreams.subtitle),
-        createOutputFilename());
+        createOutputFilename(mediaFile)
+    );
+}
+
+function getExternalSubsInput(streams) {
+    let externalSubOptions = [];
+    for(const stream of streams) {
+        if (stream.subFile) {
+            externalSubOptions.push("-i", stream.subFile);
+        }
+    }
+    return externalSubOptions.length > 0 ? externalSubOptions : false;
 }
 
 function createMapOptions(streams) {
+    console.warn(`${arguments.callee.name}`);
     const maps = [];
 
     // map video
@@ -446,13 +594,19 @@ function createMapOptions(streams) {
     }
 
     // map subtitles
+    let externalSubIndex = 1;
     for (const subtitleStream of streams.subtitle) {
-        maps.push("-map", `0:${subtitleStream.index}`);
+        if (subtitleStream.subFile) {
+            maps.push("-map", `${externalSubIndex++}:0`);
+        } else {
+            maps.push("-map", `0:${subtitleStream.index}`);
+        }
     }
     return maps;
 }
 
 function createVideoOptions() {
+    console.warn(`${arguments.callee.name}`);
     return [].concat(
         "-c:v", config.output.video.encoder,
         config.output.video.options
@@ -460,6 +614,7 @@ function createVideoOptions() {
 }
 
 function createAudioOptions() {
+    console.warn(`${arguments.callee.name}`);
     return [].concat(
         "-c:a", config.output.audio.encoder,
         config.output.audio.options
@@ -467,27 +622,30 @@ function createAudioOptions() {
 }
 
 function createSubtitleOptions() {
+    console.warn(`${arguments.callee.name}`);
     return [].concat(
         "-c:s", config.output.subtitle.encoder,
         config.output.subtitle.options
     );
 }
 
-function createOutputFilename() {
-    const outFilename = path.basename(filename, path.extname(filename)) + ".mkv";
+function createOutputFilename(sourceFile) {
+    console.warn(`${arguments.callee.name}`);
+    const outFilename = path.basename(sourceFile, path.extname(sourceFile)) + ".mkv";
     return path.join(
-        config.output.global.path,
+        config.paths.output,
         outFilename)
 }
 
 async function doConversion(options) {
+    console.warn(`${arguments.callee.name}`);
     const startTime = process.hrtime();
     try {
         const execResult = await execFile_p(
             'ffmpeg',
             options,
             {
-                cwd: config.watch,
+                cwd: config.paths.watch,
                 maxBuffer: 400 * 1024,
             },
         );
@@ -504,23 +662,156 @@ async function doConversion(options) {
     }
 }
 
-function moveSourceFile() {
-    if (!fs.existsSync(config.source_destination)) {
+function moveToProcessDirectory(sourceFile) {
+    console.warn(`${arguments.callee.name}`);
+    return moveFile(sourceFile, config.paths.process);
+}
+
+function backupSourceFile(sourceFile) {
+    console.warn(`${arguments.callee.name}`);
+    moveFile(sourceFile, config.paths.backup)
+}
+
+function moveFile(source, destination) {
+    console.warn(`${arguments.callee.name}`);
+    if (!fs.existsSync(destination)) {
         try {
-            fs.mkdirSync(config.source_destination);
+            fs.mkdirSync(destination);
         } catch (err) {
-            console.error(`Could not create source file destination directory ${config.source_destination}.`);
+            console.error(`Could not create source file destination directory ${destination}.`);
             console.error(err.reason);
         }
     }
-    const destFilename = path.join(
-        config.source_destination,
-        path.basename(filename),
+    const destinationFilename = path.join(
+        destination,
+        path.basename(source),
     );
     try {
-        fs.renameSync(filename, destFilename);
+        fs.renameSync(source, destinationFilename);
     } catch (err) {
-        console.error(`Could not move source file to destination directory ${config.source_destination}.`);
+        console.error(`Could not move source file to destination directory ${destination}.`);
         console.error(err.reason);
+    }
+    return destinationFilename;
+}
+
+class ocrParser {
+    constructor(inputText) {
+        this.textTag = 'lavfi.ocr.text=';
+        this.inputLines = inputText.split("\n");
+
+        this.currentLine = 0;
+        this.currentSubtitleIndex = 1;
+        this.endOfInput = false;
+    }
+
+    parse() {
+        let rawFrame;
+        let subtitleFrame;
+        let srtText = '';
+        while (!this.endOfInput && (rawFrame = this.readRawFrame())) {
+            if (rawFrame.text && rawFrame.text.trim() !== '') {
+                subtitleFrame = this.initSubtitleFrame();
+                subtitleFrame.startTime = moment
+                    .duration(rawFrame.time, "seconds")
+                    .format("HH:mm:ss,SSS", { precision: 0, trim: false });
+
+                subtitleFrame.text = rawFrame.text;
+
+                rawFrame = this.readRawFrame();
+                if (!rawFrame) {
+                    // unexpected end of input - just discard the incomplete subtitle
+                    // frame and use what we have.
+                    break;
+                }
+                subtitleFrame.endTime = moment
+                    .duration(rawFrame.time, "seconds")
+                    .format("HH:mm:ss,SSS", { precision: 0, trim: false });
+
+                srtText += `${subtitleFrame.index}\n`;
+                srtText += `${subtitleFrame.startTime} --> ${subtitleFrame.endTime}\n`;
+                srtText += `${subtitleFrame.text}\n\n`;
+            }
+        }
+
+        return srtText;
+    }
+
+    readRawFrame() {
+        const nextFrame = ocrParser.initRawFrame();
+
+        let nextLine;
+        if (false !== (nextLine = this.getLine())) {
+            nextLine.split(/\s+/).forEach((piece) => {
+                const x = piece.split(":");
+                switch (x[0]) {
+                    case 'frame':
+                        nextFrame.index = x[1];
+                        break;
+                    case 'pts_time':
+                        nextFrame.time = parseFloat(x[1]);
+                        break;
+                }
+            });
+        } else {
+            // end of file
+            return null;
+        }
+
+        nextFrame.text = '';
+        if ((false !== (nextLine = this.getLine())) && nextLine.startsWith(this.textTag)) {
+            nextFrame.text += nextLine.trim().substring(this.textTag.length);
+        } else {
+            // frame without a text tag is invalid
+            throw new Error(`Invalid frame format at index ${this.currentLine}`);
+        }
+
+        while (true) {
+            nextLine = this.peekLine();
+            if (nextLine === false) {
+                // end of file -
+                this.endOfInput = true;
+                break;
+            }
+
+            if (nextLine.startsWith('frame:')) {
+                // beginning of new frame - do not increment line counter
+                break;
+            }
+            this.currentLine++;
+
+            if (nextLine.trim().length > 0) {
+                nextFrame.text += '\n' + nextLine;
+            }
+        }
+
+        return nextFrame;
+    }
+
+    getLine() {
+        const line = this.inputLines[this.currentLine++];
+        return line === undefined ? false : line;
+    }
+
+    peekLine() {
+        const line = this.inputLines[this.currentLine];
+        return line === undefined ? false : line;
+    }
+
+    static initRawFrame() {
+        return {
+            index: -1,
+            time: -1,
+            text: null,
+        }
+    }
+
+    initSubtitleFrame() {
+        return {
+            index: this.currentSubtitleIndex++,
+            startTime: null,
+            endTime: null,
+            text: null,
+        }
     }
 }

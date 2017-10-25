@@ -1,6 +1,10 @@
 {
-  "watch": "M:\\HandbrakeTemp\\watch",
-  "source_destination": "M:\\HandbrakeTemp\\converted",
+  "paths": {
+    "watch": "M:\\HandbrakeTemp\\watch",
+    "process": "M:\\HandbrakeTemp\\process",
+    "backup": "M:\\HandbrakeTemp\\converted",
+    "output": "M:\\HandbrakeTemp\\out"
+  },
   "selection": {
     "video": [
       {
@@ -19,14 +23,17 @@
     "audio": [
       {
         "language": [
-          "eng"
+          "eng",
+          "jpn"
         ]
       },
       {
         "codec": [
           "dts",
           "ac3",
-          "aac"
+          "aac",
+          "flac",
+          "vorbis"
         ]
       },
       {
@@ -36,12 +43,12 @@
     "subtitle": [
       [
         {
-          "foreign": []
-        },
-        {
           "language": [
             "eng"
           ]
+        },
+        {
+          "foreign": []
         }
       ],
       [
@@ -55,7 +62,6 @@
   },
   "output": {
     "global": {
-      "path": "M:\\HandbrakeTemp\\out",
       "options": [
         "-hide_banner",
         "-y",
